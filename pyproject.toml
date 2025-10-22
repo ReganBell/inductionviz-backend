@@ -6,8 +6,19 @@ requires-python = ">=3.10"
 dependencies = [
     "fastapi",
     "uvicorn[standard]",
-    "torch",
+    "torch==2.5.1+cpu; platform_system != 'Darwin'",
+    "torch==2.5.1; platform_system == 'Darwin'",
     "transformer-lens",
     "tiktoken",
     "pydantic",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", marker = "platform_system != 'Darwin'" },
 ]
