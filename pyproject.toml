@@ -1,0 +1,13 @@
+[project]
+name = "inductionviz"
+version = "1.0.0"
+description = "Induction heads visualization tool"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "torch",
+    "transformer-lens",
+    "tiktoken",
+    "pydantic",
+]
