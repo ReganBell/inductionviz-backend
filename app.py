@@ -49,7 +49,9 @@ def _load_corpus_bigram_counts() -> Dict[int, Dict[int, int]]:
     return {prev: dict(next_counts) for prev, next_counts in counts.items()}
 
 
-CORPUS_BIGRAM_COUNTS: Dict[int, Dict[int, int]] = _load_corpus_bigram_counts()
+# Disabled to reduce memory usage for Railway deployment
+# CORPUS_BIGRAM_COUNTS: Dict[int, Dict[int, int]] = _load_corpus_bigram_counts()
+CORPUS_BIGRAM_COUNTS: Dict[int, Dict[int, int]] = {}
 
 
 MODELS: Dict[str, HookedTransformer] = {
