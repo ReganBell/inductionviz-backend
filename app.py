@@ -5,11 +5,17 @@ from typing import Dict, List, Optional
 import os
 from pathlib import Path
 from collections import defaultdict
+import psutil
+import logging
 
 import torch
 import torch.nn.functional as F
 from transformer_lens import HookedTransformer
 import tiktoken
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 # import debugpy
 # debugpy.listen(("0.0.0.0", 5678))
 # print("Waiting for debugger attach...")
@@ -20,6 +26,15 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 enc = tiktoken.get_encoding("gpt2")
 VOCAB = enc.n_vocab
+
+
+def log_memory_usage(context: str = ""):
+    """Log current memory usage in MB"""
+    process = psutil.Process()
+    mem_info = process.memory_info()
+    mem_mb = mem_info.rss / 1024 / 1024
+    logger.info(f"Memory usage {context}: {mem_mb:.2f} MB")
+    return mem_mb
 
 
 def encode(text: str) -> List[int]:
@@ -53,11 +68,14 @@ def _load_corpus_bigram_counts() -> Dict[int, Dict[int, int]]:
 # CORPUS_BIGRAM_COUNTS: Dict[int, Dict[int, int]] = _load_corpus_bigram_counts()
 CORPUS_BIGRAM_COUNTS: Dict[int, Dict[int, int]] = {}
 
+log_memory_usage("before loading models")
 
 MODELS: Dict[str, HookedTransformer] = {
     "t1": HookedTransformer.from_pretrained("attn-only-1l", device=DEVICE).to(DEVICE).eval(),
     "t2": HookedTransformer.from_pretrained("attn-only-2l", device=DEVICE).to(DEVICE).eval(),
 }
+
+log_memory_usage("after loading both models")
 
 
 def make_attn_only(
@@ -659,16 +677,20 @@ def ablate_head_analysis(
 
 @app.post("/api/analyze", response_model=AnalyzeResp)
 def analyze(req: AnalyzeReq):
+    log_memory_usage("at start of /api/analyze request")
     try:
-        return analyze_text(req.text, top_k=req.top_k, compute_ablations=req.compute_ablations)
+        result = analyze_text(req.text, top_k=req.top_k, compute_ablations=req.compute_ablations)
+        log_memory_usage("at end of /api/analyze request")
+        return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.post("/api/ablate-head", response_model=AblateHeadResp)
 def ablate_head(req: AblateHeadReq):
+    log_memory_usage("at start of /api/ablate-head request")
     try:
-        return ablate_head_analysis(
+        result = ablate_head_analysis(
             text=req.text,
             position=req.position,
             model_name=req.model_name,
@@ -676,6 +698,8 @@ def ablate_head(req: AblateHeadReq):
             head=req.head,
             top_k=req.top_k,
         )
+        log_memory_usage("at end of /api/ablate-head request")
+        return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 

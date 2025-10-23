@@ -11,6 +11,7 @@ dependencies = [
     "transformer-lens",
     "tiktoken",
     "pydantic",
+    "psutil",
 ]
 
 [[tool.uv.index]]
