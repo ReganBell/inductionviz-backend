@@ -9,3 +9,4 @@ ENV/
 .uv/
 .DS_Store
 *.log
+*.pkl

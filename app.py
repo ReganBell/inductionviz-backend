@@ -12,6 +12,9 @@ import torch
 import torch.nn.functional as F
 from transformer_lens import HookedTransformer
 import tiktoken
+import numpy as np
+
+from bigram_model import load_bigram_model, SparseBigramModel
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -76,6 +79,16 @@ MODELS: Dict[str, HookedTransformer] = {
 }
 
 log_memory_usage("after loading both models")
+
+# Load bigram model
+BIGRAM_MODEL_PATH = Path(__file__).parent / "openwebtext_bigram_counts.pkl"
+BIGRAM_MODEL: Optional[SparseBigramModel] = load_bigram_model(BIGRAM_MODEL_PATH)
+
+if BIGRAM_MODEL:
+    logger.info("Loaded OpenWebText bigram model")
+    log_memory_usage("after loading bigram model")
+else:
+    logger.warning(f"Bigram model not found at {BIGRAM_MODEL_PATH}")
 
 
 def make_attn_only(
@@ -433,10 +446,10 @@ def analyze_text(text: str, *, top_k: int = 10, compute_ablations: bool = False,
 
         for layer in range(models["t1"].cfg.n_layers):
             for head in range(models["t1"].cfg.n_heads):
-                attn1[layer][head] = cache1[f"blocks.{layer}.attn.hook_pattern"][0, head, t, :].detach().cpu().tolist()
+                attn1[layer][head] = cache1[f"blocks.{layer}.attn.hook_pattern"][0, head, t, :t].detach().cpu().tolist()
         for layer in range(models["t2"].cfg.n_layers):
             for head in range(models["t2"].cfg.n_heads):
-                attn2[layer][head] = cache2[f"blocks.{layer}.attn.hook_pattern"][0, head, t, :].detach().cpu().tolist()
+                attn2[layer][head] = cache2[f"blocks.{layer}.attn.hook_pattern"][0, head, t, :t].detach().cpu().tolist()
 
 
         # Calculate value-weighted attention patterns
@@ -675,6 +688,75 @@ def ablate_head_analysis(
     }
 
 
+@torch.no_grad()
+def get_attention_patterns(
+    text: str,
+    model_name: str = "t2",
+    layers: Optional[List[int]] = None,
+    heads: Optional[List[int]] = None,
+):
+    """
+    Get attention patterns for a given text.
+
+    Returns attention weights showing which tokens each position attends to.
+    Much lighter weight than full analyze - only computes attention, no logits.
+
+    Returns:
+        tokens: List of {id, text} dicts
+        attention: [position][layer][head][src_position] - attention weights
+        model_name: Which model was used
+        n_layers: Number of layers returned
+        n_heads: Number of heads returned
+    """
+    if model_name not in MODELS:
+        raise ValueError(f"Unknown model: {model_name}")
+
+    model = MODELS[model_name]
+    ids = encode(text)
+
+    if len(ids) < 2:
+        raise ValueError("Need at least two tokens to compute attention")
+
+    toks = torch.tensor(ids, device=DEVICE, dtype=torch.long).unsqueeze(0)
+    T = toks.size(1)
+
+    # Run model with cache to get attention patterns
+    pattern_names = [f"blocks.{layer}.attn.hook_pattern" for layer in range(model.cfg.n_layers)]
+    _, cache = model.run_with_cache(
+        toks,
+        names_filter=lambda n: n in pattern_names,
+        return_type="logits",
+    )
+
+    # Filter layers and heads if specified
+    layer_indices = layers if layers is not None else list(range(model.cfg.n_layers))
+    head_indices = heads if heads is not None else list(range(model.cfg.n_heads))
+
+    # Extract tokens
+    tokens_info = [{"id": int(i), "text": decode([int(i)])} for i in ids]
+
+    # Extract attention patterns for each position
+    attention_by_position = []
+    for t in range(1, T):  # Start from 1 since position 0 has no previous tokens
+        position_attn = []
+        for layer in layer_indices:
+            layer_attn = []
+            for head in head_indices:
+                # Get attention pattern: shape [t+1] (attention to positions 0..t)
+                attn_pattern = cache[f"blocks.{layer}.attn.hook_pattern"][0, head, t, :t+1]
+                layer_attn.append(attn_pattern.detach().cpu().tolist())
+            position_attn.append(layer_attn)
+        attention_by_position.append(position_attn)
+
+    return {
+        "tokens": tokens_info,
+        "attention": attention_by_position,
+        "model_name": model_name,
+        "n_layers": len(layer_indices),
+        "n_heads": len(head_indices),
+    }
+
+
 @app.post("/api/analyze", response_model=AnalyzeResp)
 def analyze(req: AnalyzeReq):
     log_memory_usage("at start of /api/analyze request")
@@ -727,6 +809,112 @@ def get_composition_scores(model_name: str = "t2"):
 
     scores = calculate_composition_scores(model)
     return CompositionScoresResp(**scores)
+
+
+class AttentionPatternsReq(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    text: str
+    model_name: str = "t2"  # "t1" or "t2"
+    layers: Optional[List[int]] = None  # e.g., [0, 1] or None for all
+    heads: Optional[List[int]] = None   # e.g., [0, 2] or None for all
+
+
+class AttentionPatternsResp(BaseModel):
+    tokens: List[Dict[str, object]]  # [{"id": int, "text": str}, ...]
+    attention: List[List[List[List[float]]]]  # [position][layer][head][src_position]
+    model_name: str
+    n_layers: int
+    n_heads: int
+
+
+class BigramTopKReq(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    token: str  # Input token string (will be encoded to ID)
+    k: int = 10  # Number of top predictions to return
+
+
+class BigramTopKResp(BaseModel):
+    predictions: List[Dict[str, object]]  # [{token, id, prob, logit}, ...]
+    input_token: str
+    input_token_id: int
+    available: bool  # False if token not in model
+
+
+@app.post("/api/attention-patterns", response_model=AttentionPatternsResp)
+def attention_patterns(req: AttentionPatternsReq):
+    """
+    Get attention patterns for a given text.
+
+    Returns which tokens each position attends to.
+    Much faster than full /api/analyze since it only computes attention.
+    """
+    try:
+        result = get_attention_patterns(
+            text=req.text,
+            model_name=req.model_name,
+            layers=req.layers,
+            heads=req.heads,
+        )
+        return AttentionPatternsResp(**result)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/bigram-topk", response_model=BigramTopKResp)
+def bigram_topk(req: BigramTopKReq):
+    """
+    Get top-k bigram predictions for a given input token.
+
+    Returns the most likely next tokens according to the OpenWebText
+    bigram model trained on 100k documents.
+    """
+    if not BIGRAM_MODEL:
+        raise HTTPException(
+            status_code=503,
+            detail="Bigram model not loaded. Check server logs."
+        )
+
+    # Encode the input token
+    token_ids = encode(req.token)
+
+    if len(token_ids) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Empty token string"
+        )
+
+    # Use the first token ID if multiple tokens
+    token_id = token_ids[0]
+
+    if len(token_ids) > 1:
+        logger.warning(
+            f"Input token '{req.token}' encoded to {len(token_ids)} tokens. "
+            f"Using first token ID: {token_id}"
+        )
+
+    # Get top-k predictions
+    top_k = BIGRAM_MODEL.get_top_k_next(token_id, k=req.k)
+
+    # Format response
+    predictions = []
+    for next_token_id, prob in top_k:
+        token_str = decode([next_token_id])
+        logit = float(np.log(prob)) if prob > 0 else float('-inf')
+        predictions.append({
+            "token": token_str,
+            "id": int(next_token_id),
+            "prob": float(prob),
+            "logit": logit,
+        })
+
+    return BigramTopKResp(
+        predictions=predictions,
+        input_token=req.token,
+        input_token_id=token_id,
+        available=len(top_k) > 0
+    )
 
 
 if __name__ == "__main__":

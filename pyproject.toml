@@ -7,11 +7,13 @@ dependencies = [
     "fastapi",
     "uvicorn[standard]",
     "torch==2.5.1+cpu; platform_system != 'Darwin'",
-    "torch==2.5.1; platform_system == 'Darwin'",
+    "torch>=2.4.0; platform_system == 'Darwin'",
     "transformer-lens",
     "tiktoken",
     "pydantic",
     "psutil",
+    "manim",
+    "numpy",
 ]
 
 [[tool.uv.index]]
