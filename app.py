@@ -530,6 +530,11 @@ def get_attention_patterns(
     model = MODELS[model_name]
     ids = encode(text)
 
+    # Prepend BOS token
+    bos_token_id = model.tokenizer.bos_token_id
+    if bos_token_id is not None and (len(ids) == 0 or ids[0] != bos_token_id):
+        ids = [bos_token_id] + ids
+
     if len(ids) < 2:
         raise ValueError("Need at least two tokens to compute attention")
 
