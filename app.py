@@ -795,9 +795,13 @@ def get_attention_patterns(
                     # Apply unembed to get logits
                     logits = output @ model.W_U  # [vocab_size]
 
+                    # Normalize by subtracting mean (following attention_head_analysis.py methodology)
+                    # This shows which tokens are boosted relative to average, not absolute logits
+                    logits_normalized = logits - logits.mean()
+
                     # Get top-k predictions (top 10)
                     top_k = 10
-                    top_logits, top_indices = torch.topk(logits, top_k)
+                    top_logits, top_indices = torch.topk(logits_normalized, top_k)
 
                     # Convert to list of {token, logit} dicts
                     predictions = [
