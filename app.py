@@ -82,7 +82,7 @@ def decode(ids: List[int]) -> str:
     return enc.decode(ids)
 
 # Load bigram model
-BIGRAM_MODEL_PATH = Path(__file__).parent / "openwebtext_bigram_counts.pkl"
+BIGRAM_MODEL_PATH = Path(__file__).parent / "openwebtext_bigram_counts_neox.pkl"
 BIGRAM_MODEL: Optional[SparseBigramModel] = load_bigram_model(BIGRAM_MODEL_PATH)
 
 if BIGRAM_MODEL:
@@ -777,6 +777,71 @@ def bigram_topk(req: BigramTopKReq):
         input_token=req.token,
         input_token_id=token_id,
         available=len(top_k) > 0
+    )
+
+
+class AttentionTopKReq(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    text: str
+    model_name: str = "t1"  # "t1" or "t2"
+    position: int  # Which token position to get predictions for
+    k: int = 10  # Number of top predictions to return
+
+
+class AttentionTopKResp(BaseModel):
+    predictions: List[Dict[str, object]]  # [{token, id, logit}, ...]
+    position: int
+    token: str
+
+
+@app.post("/api/attention-topk", response_model=AttentionTopKResp)
+def attention_topk(req: AttentionTopKReq):
+    """
+    Get top-k predictions from full model (with attention) for a specific position.
+
+    Returns the most likely next tokens after running the full forward pass
+    with attention, normalized by subtracting mean for interpretability.
+    """
+    if req.model_name not in MODELS:
+        raise HTTPException(status_code=400, detail=f"Unknown model: {req.model_name}")
+
+    model = MODELS[req.model_name]
+    ids = encode(req.text)
+
+    # Prepend BOS token
+    bos_token_id = model.tokenizer.bos_token_id
+    if bos_token_id is not None and (len(ids) == 0 or ids[0] != bos_token_id):
+        ids = [bos_token_id] + ids
+
+    if req.position < 0 or req.position >= len(ids):
+        raise HTTPException(status_code=400, detail=f"Invalid position {req.position}")
+
+    toks = torch.tensor(ids, device=DEVICE, dtype=torch.long).unsqueeze(0)
+
+    # Run model to get logits
+    logits = model(toks)  # [1, seq_len, vocab_size]
+    position_logits = logits[0, req.position, :]  # [vocab_size]
+
+    # Normalize by subtracting mean (same as OV circuit normalization)
+    logits_normalized = position_logits - position_logits.mean()
+
+    # Get top-k
+    top_logits, top_indices = torch.topk(logits_normalized, req.k)
+
+    predictions = [
+        {
+            "token": decode([int(idx)]),
+            "id": int(idx),
+            "logit": float(logit),
+        }
+        for idx, logit in zip(top_indices, top_logits)
+    ]
+
+    return AttentionTopKResp(
+        predictions=predictions,
+        position=req.position,
+        token=decode([ids[req.position]]) if req.position < len(ids) else ""
     )
 
 
