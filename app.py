@@ -11,7 +11,6 @@ import logging
 import torch
 import torch.nn.functional as F
 from transformer_lens import HookedTransformer
-import tiktoken
 import numpy as np
 
 from bigram_model import load_bigram_model, SparseBigramModel
@@ -27,8 +26,6 @@ logger = logging.getLogger(__name__)
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-enc = tiktoken.get_encoding("gpt2")
-VOCAB = enc.n_vocab
 
 
 def log_memory_usage(context: str = ""):
@@ -38,14 +35,6 @@ def log_memory_usage(context: str = ""):
     mem_mb = mem_info.rss / 1024 / 1024
     logger.info(f"Memory usage {context}: {mem_mb:.2f} MB")
     return mem_mb
-
-
-def encode(text: str) -> List[int]:
-    return enc.encode(text)
-
-
-def decode(ids: List[int]) -> str:
-    return enc.decode(ids)
 
 
 def _corpus_path() -> Path:
@@ -79,6 +68,18 @@ MODELS: Dict[str, HookedTransformer] = {
 }
 
 log_memory_usage("after loading both models")
+
+# Use the model's tokenizer (NeoX, not GPT-2)
+enc = MODELS["t1"].tokenizer
+VOCAB = MODELS["t1"].cfg.d_vocab
+
+
+def encode(text: str) -> List[int]:
+    return enc.encode(text)
+
+
+def decode(ids: List[int]) -> str:
+    return enc.decode(ids)
 
 # Load bigram model
 BIGRAM_MODEL_PATH = Path(__file__).parent / "openwebtext_bigram_counts.pkl"
