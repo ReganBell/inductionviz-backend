@@ -894,6 +894,7 @@ class AttentionPatternsReq(BaseModel):
 class AttentionPatternsResp(BaseModel):
     tokens: List[Dict[str, object]]  # [{"id": int, "text": str}, ...]
     attention: List[List[List[List[float]]]]  # [position][layer][head][src_position]
+    ov_predictions: Optional[List[List[List[List[Dict[str, object]]]]]] = None  # [token][layer][head][prediction]
     model_name: str
     n_layers: int
     n_heads: int
