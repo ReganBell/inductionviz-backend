@@ -780,6 +780,70 @@ def bigram_topk(req: BigramTopKReq):
     )
 
 
+@app.post("/api/bigram-batch", response_model=BigramBatchResp)
+def bigram_batch(req: BigramBatchReq):
+    """
+    Get top-k bigram predictions for all tokens in the input text.
+
+    Tokenizes the input text and returns predictions for each token position.
+    For position i, returns the top-k most likely tokens to follow token[i].
+    """
+    if not BIGRAM_MODEL:
+        raise HTTPException(
+            status_code=503,
+            detail="Bigram model not loaded. Check server logs."
+        )
+
+    # Encode the input text
+    token_ids = encode(req.text)
+
+    if len(token_ids) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Empty text string"
+        )
+
+    # Get token information
+    tokens = [{"id": int(tid), "text": decode([tid])} for tid in token_ids]
+
+    # Get predictions for each token (except the last one, which has no "next" token)
+    all_predictions = []
+    for token_id in token_ids:
+        # Get top-k predictions for this token
+        top_k = BIGRAM_MODEL.get_top_k_next(token_id, k=req.k)
+
+        # Format predictions
+        predictions = []
+        for next_token_id, prob in top_k:
+            token_str = decode([next_token_id])
+            logit = float(np.log(prob)) if prob > 0 else float('-inf')
+            predictions.append({
+                "token": token_str,
+                "id": int(next_token_id),
+                "prob": float(prob),
+                "logit": logit,
+            })
+
+        all_predictions.append(predictions)
+
+    return BigramBatchResp(
+        tokens=tokens,
+        predictions=all_predictions
+    )
+
+
+class BigramBatchReq(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    text: str  # Input text to tokenize and analyze
+    k: int = 10  # Number of top predictions per token
+
+
+class BigramBatchResp(BaseModel):
+    tokens: List[Dict[str, object]]  # [{id, text}, ...] for all tokens
+    predictions: List[List[Dict[str, object]]]  # [position][prediction] - predictions for each position
+
+
 class AttentionTopKReq(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
