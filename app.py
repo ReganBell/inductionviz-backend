@@ -266,76 +266,6 @@ def _run_with_cache(model: HookedTransformer, toks: torch.Tensor):
     return logits.squeeze(0), cache
 
 
-@torch.no_grad()
-def _calculate_all_head_deltas(model: HookedTransformer, toks: torch.Tensor, position: int, next_token_id: int, context_token_ids: List[int], top_k: int = 10):
-    """
-    Calculate delta logits for ablating each head at a given position.
-    Only considers deltas for tokens that actually appear in the context.
-    Returns dict with rich information about what each head is doing.
-    """
-    # Get baseline logits at this position
-    logits_base = model(toks)[0, position]  # [vocab]
-
-    # Get unique token IDs from context (tokens the head could be attending to)
-    context_vocab = set(context_token_ids)
-
-    deltas = {}
-
-    for layer in range(model.cfg.n_layers):
-        for head in range(model.cfg.n_heads):
-            # Create hook to zero this specific head
-            # Need to use a closure to capture the current head value
-            def make_zero_head_hook(head_idx):
-                def zero_head_hook(v, hook):
-                    v[:, :, head_idx, :] = 0.0
-                    return v
-                return zero_head_hook
-
-            # Run model with head ablated
-            # Use hook_z (before W_O) not hook_result (after W_O)
-            logits_ablated = model.run_with_hooks(
-                toks,
-                fwd_hooks=[(f"blocks.{layer}.attn.hook_z", make_zero_head_hook(head))]
-            )[0, position]
-
-            # Calculate delta logits: baseline - ablated = head's contribution
-            delta_logits = logits_base - logits_ablated  # [vocab]
-
-            # Filter to only context tokens
-            context_deltas = {tid: float(delta_logits[tid]) for tid in context_vocab}
-
-            # Get magnitude (sum of absolute deltas for context tokens only)
-            magnitude = sum(abs(d) for d in context_deltas.values())
-
-            # Sort context tokens by delta
-            sorted_context = sorted(context_deltas.items(), key=lambda x: x[1], reverse=True)
-
-            # Get top promoted tokens from context
-            top_promoted = [
-                {"token": decode([int(tid)]), "id": int(tid), "delta": float(delta)}
-                for tid, delta in sorted_context[:top_k]
-                if delta > 0
-            ]
-
-            # Get top suppressed tokens from context
-            top_suppressed = [
-                {"token": decode([int(tid)]), "id": int(tid), "delta": float(delta)}
-                for tid, delta in sorted_context[-top_k:][::-1]
-                if delta < 0
-            ]
-
-            # Delta for the actual next token
-            actual_token_delta = float(delta_logits[next_token_id])
-
-            deltas[f"L{layer}H{head}"] = {
-                "magnitude": magnitude,
-                "actual_token_delta": actual_token_delta,
-                "top_promoted": top_promoted,
-                "top_suppressed": top_suppressed,
-            }
-
-    return deltas
-
 
 @torch.no_grad()
 def _calculate_value_weighted_attention(cache: Dict[str, torch.Tensor], n_layers: int, t: int) -> List[List[List[float]]]:
@@ -559,23 +489,6 @@ class AnalyzeResp(BaseModel):
     t2_heads: int
 
 
-class AblateHeadReq(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    text: str
-    position: int
-    model_name: str  # "t1" or "t2"
-    layer: int
-    head: int
-    top_k: int = 10
-
-
-class AblateHeadResp(BaseModel):
-    with_head: List[Dict[str, object]]
-    without_head: List[Dict[str, object]]
-    delta_positive: List[Dict[str, object]]
-    delta_negative: List[Dict[str, object]]
-
 
 app = FastAPI()
 app.add_middleware(
@@ -586,106 +499,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-@torch.no_grad()
-def ablate_head_analysis(
-    text: str,
-    position: int,
-    model_name: str,
-    layer: int,
-    head: int,
-    top_k: int = 10,
-    models: Optional[Dict[str, HookedTransformer]] = None,
-):
-    if models is None:
-        models = MODELS
-
-    if model_name not in models:
-        raise ValueError(f"Unknown model: {model_name}")
-
-    model = models[model_name]
-    ids = encode(text)
-
-    # Position here is the token index we're hovering/locked on
-    # The frontend sends us the index in the token array (which includes BOS at position 0)
-    # For the analysis positions array, position t predicts token at index t+1
-    # So we need to look at logits from position t-1 to see predictions for token at position t
-
-    if position < 1 or position >= len(ids):
-        raise ValueError(f"Position {position} out of range for text with {len(ids)} tokens")
-
-    if layer < 0 or layer >= model.cfg.n_layers:
-        raise ValueError(f"Layer {layer} out of range for model with {model.cfg.n_layers} layers")
-
-    if head < 0 or head >= model.cfg.n_heads:
-        raise ValueError(f"Head {head} out of range for model with {model.cfg.n_heads} heads")
-
-    toks = torch.tensor(ids, device=DEVICE, dtype=torch.long).unsqueeze(0)
-
-    # We want to see how the head affects prediction of the token at 'position'
-    # So we look at logits from position-1 (which predict position)
-    logit_pos = position - 1
-
-    # Get context token IDs (tokens that the model can attend to at this position)
-    context_token_ids = ids[:position]
-    context_vocab = set(context_token_ids)
-
-    # 1) Baseline logits at the position of interest
-    logits_base = model(toks)[0, logit_pos]  # [vocab]
-
-    # 2) Re-run with the chosen head zeroed
-    def zero_one_head_hook(v, hook):
-        # v: [batch, seq, n_heads, d_head] at hook_z (before W_O)
-        v[:, :, head, :] = 0.0
-        return v
-
-    logits_no_head = model.run_with_hooks(
-        toks,
-        fwd_hooks=[(f"blocks.{layer}.attn.hook_z", zero_one_head_hook)]
-    )[0, logit_pos]  # [vocab]
-
-    delta_logits = logits_base - logits_no_head  # the head's exact contribution to each vocab logit
-
-    # Filter delta_logits to only context tokens
-    context_deltas = {tid: float(delta_logits[tid]) for tid in context_vocab}
-
-    # Sort context tokens by delta
-    sorted_context_pos = sorted(context_deltas.items(), key=lambda x: x[1], reverse=True)
-    sorted_context_neg = sorted(context_deltas.items(), key=lambda x: x[1])
-
-    # Get top-k results - still show full vocab for with/without
-    topk_with = _topk_pack(logits_base, top_k)
-    topk_without = _topk_pack(logits_no_head, top_k)
-
-    # For deltas, only show context tokens
-    topk_delta = [
-        {
-            "token": decode([int(tid)]),
-            "id": int(tid),
-            "logit": float(delta),
-            "prob": 0.0,  # prob doesn't make sense for deltas
-        }
-        for tid, delta in sorted_context_pos[:top_k]
-        if delta > 0
-    ]
-
-    topk_delta_neg = [
-        {
-            "token": decode([int(tid)]),
-            "id": int(tid),
-            "logit": float(delta),
-            "prob": 0.0,  # prob doesn't make sense for deltas
-        }
-        for tid, delta in sorted_context_neg[:top_k]
-        if delta < 0
-    ]
-
-    return {
-        "with_head": topk_with,
-        "without_head": topk_without,
-        "delta_positive": topk_delta,
-        "delta_negative": topk_delta_neg,
-    }
 
 
 @torch.no_grad()
@@ -722,12 +535,9 @@ def get_attention_patterns(
     toks = torch.tensor(ids, device=DEVICE, dtype=torch.long).unsqueeze(0)
     T = toks.size(1)
 
-    # Run model with cache to get attention patterns and residual stream
+    # Run model with cache to get attention patterns
+    # For OV circuit, we only need attention patterns - we'll use W_E directly
     hook_names = [f"blocks.{layer}.attn.hook_pattern" for layer in range(model.cfg.n_layers)]
-    if compute_ov:
-        # Also cache residual stream after embedding for OV circuit
-        hook_names.append("hook_embed")
-        hook_names.extend([f"blocks.{layer}.hook_resid_pre" for layer in range(model.cfg.n_layers)])
 
     _, cache = model.run_with_cache(
         toks,
@@ -765,28 +575,17 @@ def get_attention_patterns(
         for t in range(T):
             token_ov = []
 
-            # Get residual stream at this token position
-            if t == 0:
-                residual = cache["hook_embed"][0, t, :]  # [d_model]
-            else:
-                # For positions > 0, we want the residual after the previous layer
-                # For layer 0, use hook_embed; for layer L, use hook_resid_pre[L]
-                # Since we're computing OV for layer L, we need residual going INTO layer L
-                # which is hook_resid_pre[L]
-                residual = cache["hook_embed"][0, t, :]  # [d_model]
+            # Get token embedding directly (matching attention_head_analysis.py methodology)
+            # This computes OV circuit through the embedding matrix, not the residual stream
+            token_id = ids[t]
+            token_embedding = model.W_E[token_id]  # [d_model]
 
             for layer in layer_indices:
-                # Get residual at start of this layer
-                if layer > 0:
-                    residual_layer = cache[f"blocks.{layer}.hook_resid_pre"][0, t, :]
-                else:
-                    residual_layer = cache["hook_embed"][0, t, :]
-
                 layer_ov = []
                 for head in head_indices:
                     # Apply W_V to get value vector
                     W_V = model.W_V[layer, head]  # [d_model, d_head]
-                    value = residual_layer @ W_V  # [d_head]
+                    value = token_embedding @ W_V  # [d_head]
 
                     # Apply W_O to get output vector
                     W_O = model.W_O[layer, head]  # [d_head, d_model]
@@ -838,24 +637,6 @@ def analyze(req: AnalyzeReq):
     try:
         result = analyze_text(req.text, top_k=req.top_k, compute_ablations=req.compute_ablations)
         log_memory_usage("at end of /api/analyze request")
-        return result
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-
-@app.post("/api/ablate-head", response_model=AblateHeadResp)
-def ablate_head(req: AblateHeadReq):
-    log_memory_usage("at start of /api/ablate-head request")
-    try:
-        result = ablate_head_analysis(
-            text=req.text,
-            position=req.position,
-            model_name=req.model_name,
-            layer=req.layer,
-            head=req.head,
-            top_k=req.top_k,
-        )
-        log_memory_usage("at end of /api/ablate-head request")
         return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
