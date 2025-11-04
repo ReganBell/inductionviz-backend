@@ -694,16 +694,18 @@ def get_attention_patterns(
     model_name: str = "t2",
     layers: Optional[List[int]] = None,
     heads: Optional[List[int]] = None,
+    compute_ov: bool = True,
 ):
     """
     Get attention patterns for a given text.
 
     Returns attention weights showing which tokens each position attends to.
-    Much lighter weight than full analyze - only computes attention, no logits.
+    Optionally computes OV circuit predictions for each token.
 
     Returns:
         tokens: List of {id, text} dicts
         attention: [position][layer][head][src_position] - attention weights
+        ov_predictions: [token][layer][head] -> list of top-k {token, logit} predictions
         model_name: Which model was used
         n_layers: Number of layers returned
         n_heads: Number of heads returned
@@ -720,11 +722,16 @@ def get_attention_patterns(
     toks = torch.tensor(ids, device=DEVICE, dtype=torch.long).unsqueeze(0)
     T = toks.size(1)
 
-    # Run model with cache to get attention patterns
-    pattern_names = [f"blocks.{layer}.attn.hook_pattern" for layer in range(model.cfg.n_layers)]
+    # Run model with cache to get attention patterns and residual stream
+    hook_names = [f"blocks.{layer}.attn.hook_pattern" for layer in range(model.cfg.n_layers)]
+    if compute_ov:
+        # Also cache residual stream after embedding for OV circuit
+        hook_names.append("hook_embed")
+        hook_names.extend([f"blocks.{layer}.hook_resid_pre" for layer in range(model.cfg.n_layers)])
+
     _, cache = model.run_with_cache(
         toks,
-        names_filter=lambda n: n in pattern_names,
+        names_filter=lambda n: n in hook_names,
         return_type="logits",
     )
 
@@ -748,13 +755,77 @@ def get_attention_patterns(
             position_attn.append(layer_attn)
         attention_by_position.append(position_attn)
 
-    return {
+    # Compute OV circuit predictions if requested
+    ov_predictions = None
+    if compute_ov:
+        # Get residual stream after embedding
+        # We'll use hook_embed for position 0, and hook_resid_pre for other positions
+        ov_predictions = []
+
+        for t in range(T):
+            token_ov = []
+
+            # Get residual stream at this token position
+            if t == 0:
+                residual = cache["hook_embed"][0, t, :]  # [d_model]
+            else:
+                # For positions > 0, we want the residual after the previous layer
+                # For layer 0, use hook_embed; for layer L, use hook_resid_pre[L]
+                # Since we're computing OV for layer L, we need residual going INTO layer L
+                # which is hook_resid_pre[L]
+                residual = cache["hook_embed"][0, t, :]  # [d_model]
+
+            for layer in layer_indices:
+                # Get residual at start of this layer
+                if layer > 0:
+                    residual_layer = cache[f"blocks.{layer}.hook_resid_pre"][0, t, :]
+                else:
+                    residual_layer = cache["hook_embed"][0, t, :]
+
+                layer_ov = []
+                for head in head_indices:
+                    # Apply W_V to get value vector
+                    W_V = model.W_V[layer, head]  # [d_model, d_head]
+                    value = residual_layer @ W_V  # [d_head]
+
+                    # Apply W_O to get output vector
+                    W_O = model.W_O[layer, head]  # [d_head, d_model]
+                    output = value @ W_O  # [d_model]
+
+                    # Apply unembed to get logits
+                    logits = output @ model.W_U  # [vocab_size]
+
+                    # Get top-k predictions (top 10)
+                    top_k = 10
+                    top_logits, top_indices = torch.topk(logits, top_k)
+
+                    # Convert to list of {token, logit} dicts
+                    predictions = [
+                        {
+                            "token": decode([int(idx)]),
+                            "id": int(idx),
+                            "logit": float(logit),
+                        }
+                        for idx, logit in zip(top_indices, top_logits)
+                    ]
+                    layer_ov.append(predictions)
+
+                token_ov.append(layer_ov)
+
+            ov_predictions.append(token_ov)
+
+    result = {
         "tokens": tokens_info,
         "attention": attention_by_position,
         "model_name": model_name,
         "n_layers": len(layer_indices),
         "n_heads": len(head_indices),
     }
+
+    if ov_predictions is not None:
+        result["ov_predictions"] = ov_predictions
+
+    return result
 
 
 @app.post("/api/analyze", response_model=AnalyzeResp)
