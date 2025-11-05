@@ -90,6 +90,28 @@ def decode(ids: List[int]) -> str:
 
 # Load bigram model
 BIGRAM_MODEL_PATH = Path(__file__).parent / "openwebtext_bigram_counts_neox.pkl"
+
+# Download from R2 if not present (for Railway deployment)
+BIGRAM_MODEL_URL = os.getenv("BIGRAM_MODEL_URL")
+if BIGRAM_MODEL_URL and not BIGRAM_MODEL_PATH.exists():
+    logger.info(f"Bigram model not found locally, downloading from R2: {BIGRAM_MODEL_URL}")
+    try:
+        import urllib.request
+        import tempfile
+
+        # Download to temp file first, then move (atomic operation)
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pkl') as tmp_file:
+            logger.info("Downloading bigram model (291MB, this may take a minute)...")
+            urllib.request.urlretrieve(BIGRAM_MODEL_URL, tmp_file.name)
+
+            # Move to final location
+            import shutil
+            shutil.move(tmp_file.name, BIGRAM_MODEL_PATH)
+            logger.info(f"Bigram model downloaded successfully to {BIGRAM_MODEL_PATH}")
+    except Exception as e:
+        logger.error(f"Failed to download bigram model: {e}")
+        logger.warning("Bigram endpoints will return 503 errors")
+
 BIGRAM_MODEL: Optional[SparseBigramModel] = load_bigram_model(BIGRAM_MODEL_PATH)
 
 if BIGRAM_MODEL:
