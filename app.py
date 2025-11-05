@@ -7,6 +7,7 @@ from pathlib import Path
 from collections import defaultdict
 import psutil
 import logging
+import threading
 
 import torch
 import torch.nn.functional as F
@@ -65,6 +66,12 @@ log_memory_usage("before loading models")
 MODELS: Dict[str, HookedTransformer] = {
     "t1": HookedTransformer.from_pretrained("attn-only-1l", device=DEVICE).to(DEVICE).eval(),
     "t2": HookedTransformer.from_pretrained("attn-only-2l", device=DEVICE).to(DEVICE).eval(),
+}
+
+# Locks to ensure thread-safe model access
+MODEL_LOCKS: Dict[str, threading.Lock] = {
+    "t1": threading.Lock(),
+    "t2": threading.Lock(),
 }
 
 log_memory_usage("after loading both models")
@@ -230,28 +237,6 @@ def _resolve_top_k(top_k: int, vocab_size: int) -> int:
     return top_k
 
 
-def _build_bigram_logit_map(ids: List[int], vocab: int, laplace: float = 1.0) -> Dict[int, Optional[torch.Tensor]]:
-    logit_map: Dict[int, Optional[torch.Tensor]] = {}
-    if CORPUS_BIGRAM_COUNTS:
-        unique_prev = {int(pid) for pid in ids[:-1]}
-        print('unique_prev', unique_prev)
-        for prev_id in unique_prev:
-            next_counts = CORPUS_BIGRAM_COUNTS.get(prev_id)
-            if not next_counts:
-                logit_map[prev_id] = None  # Explicitly mark as missing
-                continue
-            vec = torch.full((vocab,), laplace, dtype=torch.float32, device=DEVICE)
-            for next_id, count in next_counts.items():
-                vec[next_id] += float(count)
-            probs = vec / vec.sum()
-            logit_map[prev_id] = torch.log(probs)
-        # Ensure all unique_prev tokens are in the map (either with logits or None)
-        for prev_id in unique_prev:
-            if prev_id not in logit_map:
-                logit_map[prev_id] = None
-    return logit_map
-
-
 @torch.no_grad()
 def _run_with_cache(model: HookedTransformer, toks: torch.Tensor):
     # Capture both attention patterns and value vectors
@@ -341,6 +326,37 @@ def _topk_pack(vec: torch.Tensor, topk: int) -> List[Dict[str, float]]:
     ]
 
 
+def _get_bigram_predictions(token_id: int, k: int = 10) -> Optional[List[Dict[str, object]]]:
+    """
+    Get top-k bigram predictions for a given token ID using the SparseBigramModel.
+
+    Returns None if bigram model is not loaded or token not in model.
+    Returns list of prediction dicts with token, id, prob, logit fields.
+    """
+    if not BIGRAM_MODEL:
+        return None
+
+    # Get top-k predictions from the bigram model
+    top_k = BIGRAM_MODEL.get_top_k_next(token_id, k=k)
+
+    if len(top_k) == 0:
+        return None
+
+    # Format predictions
+    predictions = []
+    for next_token_id, prob in top_k:
+        token_str = decode([next_token_id])
+        logit = float(np.log(prob)) if prob > 0 else float('-inf')
+        predictions.append({
+            "token": token_str,
+            "id": int(next_token_id),
+            "prob": float(prob),
+            "logit": logit,
+        })
+
+    return predictions
+
+
 def analyze_text(text: str, *, top_k: int = 10, compute_ablations: bool = False, models: Optional[Dict[str, HookedTransformer]] = None):
     if models is None:
         models = MODELS
@@ -348,12 +364,16 @@ def analyze_text(text: str, *, top_k: int = 10, compute_ablations: bool = False,
     # with open('hp.txt', 'r') as f:
     #     text = f.read()
     ids = encode(text)
+
+    # Prepend BOS token (consistent with attention-patterns endpoint)
+    bos_token_id = models["t1"].tokenizer.bos_token_id
+    if bos_token_id is not None and (len(ids) == 0 or ids[0] != bos_token_id):
+        ids = [bos_token_id] + ids
+
     if len(ids) < 2:
         raise ValueError("Need at least two tokens")
     toks = torch.tensor(ids, device=DEVICE, dtype=torch.long).unsqueeze(0)
     T = toks.size(1)
-
-    bigram_logit_map = _build_bigram_logit_map(ids, VOCAB)
 
     logits1_full, cache1 = _run_with_cache(models["t1"], toks)
     logits2_full, cache2 = _run_with_cache(models["t2"], toks)
@@ -367,8 +387,10 @@ def analyze_text(text: str, *, top_k: int = 10, compute_ablations: bool = False,
         prev_id = ids[t - 1]
         next_id = ids[t]
 
-        bigram_logits = bigram_logit_map.get(prev_id)
-        bigram_available = bigram_logits is not None
+        # Get bigram predictions using the shared function
+        bigram_predictions = _get_bigram_predictions(prev_id, k=top_k)
+        bigram_available = bigram_predictions is not None
+
         l1 = logits1_full[t - 1]
         l2 = logits2_full[t - 1]
 
@@ -415,7 +437,25 @@ def analyze_text(text: str, *, top_k: int = 10, compute_ablations: bool = False,
             attn_match = {"t1": sum_t1, "t2": sum_t2}
 
         # Calculate losses - handle missing bigram data
-        loss_bigram = float(-bigram_logits[next_id].item()) if bigram_available else None
+        if bigram_available and bigram_predictions:
+            # Find the actual next token in the predictions to get its probability
+            next_token_prob = None
+            for pred in bigram_predictions:
+                if pred["id"] == next_id:
+                    next_token_prob = pred["prob"]
+                    break
+            # If token not in top-k, get it directly
+            if next_token_prob is None:
+                full_preds = _get_bigram_predictions(prev_id, k=VOCAB)
+                if full_preds:
+                    for pred in full_preds:
+                        if pred["id"] == next_id:
+                            next_token_prob = pred["prob"]
+                            break
+            loss_bigram = float(-np.log(next_token_prob)) if next_token_prob and next_token_prob > 0 else None
+        else:
+            loss_bigram = None
+
         loss_t1 = float(-F.log_softmax(l1, dim=-1)[next_id].item())
         loss_t2 = float(-F.log_softmax(l2, dim=-1)[next_id].item())
 
@@ -423,11 +463,8 @@ def analyze_text(text: str, *, top_k: int = 10, compute_ablations: bool = False,
         topk_data = {
             "t1": _topk_pack(l1, top_k),
             "t2": _topk_pack(l2, top_k),
+            "bigram": bigram_predictions if bigram_available else None,
         }
-        if bigram_available:
-            topk_data["bigram"] = _topk_pack(bigram_logits, top_k)
-        else:
-            topk_data["bigram"] = None
 
         positions.append(
             {
@@ -509,26 +546,36 @@ def get_attention_patterns(
     layers: Optional[List[int]] = None,
     heads: Optional[List[int]] = None,
     compute_ov: bool = True,
+    compute_full: bool = True,
+    top_k: int = 10,
+    normalize_ov: bool = True,
 ):
     """
     Get attention patterns for a given text.
 
     Returns attention weights showing which tokens each position attends to.
     Optionally computes OV circuit predictions for each token.
+    Optionally computes full model predictions (with attention) for each token.
 
     Returns:
         tokens: List of {id, text} dicts
         attention: [position][layer][head][src_position] - attention weights
         ov_predictions: [token][layer][head] -> list of top-k {token, logit} predictions
+        full_predictions: [token] -> list of top-k {token, id, logit} predictions (full model with attention)
         model_name: Which model was used
         n_layers: Number of layers returned
         n_heads: Number of heads returned
     """
+    logger.info(f"get_attention_patterns called with text='{text}', model_name={model_name}, compute_full={compute_full}, top_k={top_k}")
+
     if model_name not in MODELS:
         raise ValueError(f"Unknown model: {model_name}")
 
     model = MODELS[model_name]
+    model_lock = MODEL_LOCKS[model_name]
+
     ids = encode(text)
+    logger.info(f"Encoded to {len(ids)} tokens: {ids}")
 
     # Prepend BOS token
     bos_token_id = model.tokenizer.bos_token_id
@@ -541,35 +588,57 @@ def get_attention_patterns(
     toks = torch.tensor(ids, device=DEVICE, dtype=torch.long).unsqueeze(0)
     T = toks.size(1)
 
-    # Run model with cache to get attention patterns
-    # For OV circuit, we only need attention patterns - we'll use W_E directly
-    hook_names = [f"blocks.{layer}.attn.hook_pattern" for layer in range(model.cfg.n_layers)]
+    # Use lock to ensure thread-safe model access
+    with model_lock:
+        # Reset any existing hooks to ensure clean state
+        model.reset_hooks()
 
-    _, cache = model.run_with_cache(
-        toks,
-        names_filter=lambda n: n in hook_names,
-        return_type="logits",
-    )
+        # Run model with cache to get attention patterns and logits
+        # For OV circuit, we only need attention patterns - we'll use W_E directly
+        hook_names = [f"blocks.{layer}.attn.hook_pattern" for layer in range(model.cfg.n_layers)]
 
-    # Filter layers and heads if specified
-    layer_indices = layers if layers is not None else list(range(model.cfg.n_layers))
-    head_indices = heads if heads is not None else list(range(model.cfg.n_heads))
+        logits, cache = model.run_with_cache(
+            toks,
+            names_filter=lambda n: n in hook_names,
+            return_type="logits",
+        )
+        logger.info(f"Got logits with shape: {logits.shape}, toks shape: {toks.shape}")
 
-    # Extract tokens
-    tokens_info = [{"id": int(i), "text": decode([int(i)])} for i in ids]
+        # Log cache contents
+        for key in cache.keys():
+            logger.info(f"Cache key: {key}, shape: {cache[key].shape}")
 
-    # Extract attention patterns for each position
-    attention_by_position = []
-    for t in range(1, T):  # Start from 1 since position 0 has no previous tokens
-        position_attn = []
-        for layer in layer_indices:
-            layer_attn = []
-            for head in head_indices:
-                # Get attention pattern: shape [t+1] (attention to positions 0..t)
-                attn_pattern = cache[f"blocks.{layer}.attn.hook_pattern"][0, head, t, :t+1]
-                layer_attn.append(attn_pattern.detach().cpu().tolist())
-            position_attn.append(layer_attn)
-        attention_by_position.append(position_attn)
+        # Filter layers and heads if specified
+        layer_indices = layers if layers is not None else list(range(model.cfg.n_layers))
+        head_indices = heads if heads is not None else list(range(model.cfg.n_heads))
+
+        # Extract tokens
+        tokens_info = [{"id": int(i), "text": decode([int(i)])} for i in ids]
+
+        # Extract attention patterns for each position (must be done inside lock while cache is valid)
+        attention_by_position = []
+        for pos in range(1, T):  # Start from 1 since position 0 has no previous tokens
+            position_attn = []
+            for layer in layer_indices:
+                layer_attn = []
+                for head in head_indices:
+                    # Get attention pattern: shape [pos+1] (attention to positions 0..pos)
+                    cache_key = f"blocks.{layer}.attn.hook_pattern"
+                    if cache_key not in cache:
+                        logger.error(f"Cache key {cache_key} not found! Available keys: {list(cache.keys())}")
+                        raise ValueError(f"Cache missing expected key: {cache_key}")
+
+                    attn_tensor = cache[cache_key]
+                    logger.info(f"Accessing {cache_key} with shape {attn_tensor.shape}, pos={pos}, T={T}")
+
+                    if pos >= attn_tensor.shape[2]:
+                        logger.error(f"Position {pos} out of bounds for tensor shape {attn_tensor.shape}")
+                        raise ValueError(f"Position {pos} >= cache dimension {attn_tensor.shape[2]}")
+
+                    attn_pattern = attn_tensor[0, head, pos, :pos+1]
+                    layer_attn.append(attn_pattern.detach().cpu().tolist())
+                position_attn.append(layer_attn)
+            attention_by_position.append(position_attn)
 
     # Compute OV circuit predictions if requested
     ov_predictions = None
@@ -598,15 +667,19 @@ def get_attention_patterns(
                     output = value @ W_O  # [d_model]
 
                     # Apply unembed to get logits
-                    logits = output @ model.W_U  # [vocab_size]
+                    ov_logits = output @ model.W_U  # [vocab_size]
 
-                    # Normalize by subtracting mean (following attention_head_analysis.py methodology)
-                    # This shows which tokens are boosted relative to average, not absolute logits
-                    logits_normalized = logits - logits.mean()
+                    # Optionally normalize by subtracting mean
+                    # Normalized: shows which tokens are boosted relative to average
+                    # Non-normalized: shows raw logit boosts (useful for understanding absolute effects)
+                    if normalize_ov:
+                        ov_logits_for_topk = ov_logits - ov_logits.mean()
+                    else:
+                        ov_logits_for_topk = ov_logits
 
                     # Get top-k predictions (top 10)
                     top_k = 10
-                    top_logits, top_indices = torch.topk(logits_normalized, top_k)
+                    top_logits, top_indices = torch.topk(ov_logits_for_topk, top_k)
 
                     # Convert to list of {token, logit} dicts
                     predictions = [
@@ -623,6 +696,51 @@ def get_attention_patterns(
 
             ov_predictions.append(token_ov)
 
+    # Compute full model predictions if requested
+    full_predictions = None
+    full_predictions_normalized = None
+    if compute_full:
+        logger.info(f"Computing full predictions with logits shape: {logits.shape}, T={T}")
+        full_predictions = []
+        full_predictions_normalized = []
+
+        for t in range(T):
+            position_logits = logits[0, t, :]  # [vocab_size]
+
+            # Compute probabilities for actual model output
+            probs = F.softmax(position_logits, dim=-1)
+
+            # Normalize by subtracting mean for interpretable "attention boost"
+            logits_normalized = position_logits - position_logits.mean()
+
+            # Get top-k for both
+            top_logits_norm, top_indices_norm = torch.topk(logits_normalized, top_k)
+            top_probs, top_indices_prob = torch.topk(probs, top_k)
+
+            # Normalized logits (attention boost)
+            predictions_normalized = [
+                {
+                    "token": decode([int(idx)]),
+                    "id": int(idx),
+                    "logit": float(logit),
+                }
+                for idx, logit in zip(top_indices_norm, top_logits_norm)
+            ]
+            full_predictions_normalized.append(predictions_normalized)
+
+            # Actual probabilities
+            predictions_prob = [
+                {
+                    "token": decode([int(idx)]),
+                    "id": int(idx),
+                    "prob": float(prob),
+                }
+                for idx, prob in zip(top_indices_prob, top_probs)
+            ]
+            full_predictions.append(predictions_prob)
+
+        logger.info(f"Computed {len(full_predictions)} full predictions")
+
     result = {
         "tokens": tokens_info,
         "attention": attention_by_position,
@@ -633,6 +751,10 @@ def get_attention_patterns(
 
     if ov_predictions is not None:
         result["ov_predictions"] = ov_predictions
+
+    if full_predictions is not None:
+        result["full_predictions"] = full_predictions
+        result["full_predictions_normalized"] = full_predictions_normalized
 
     return result
 
@@ -680,12 +802,15 @@ class AttentionPatternsReq(BaseModel):
     model_name: str = "t2"  # "t1" or "t2"
     layers: Optional[List[int]] = None  # e.g., [0, 1] or None for all
     heads: Optional[List[int]] = None   # e.g., [0, 2] or None for all
+    normalize_ov: bool = True  # Whether to normalize OV logits by subtracting mean
 
 
 class AttentionPatternsResp(BaseModel):
     tokens: List[Dict[str, object]]  # [{"id": int, "text": str}, ...]
     attention: List[List[List[List[float]]]]  # [position][layer][head][src_position]
     ov_predictions: Optional[List[List[List[List[Dict[str, object]]]]]] = None  # [token][layer][head][prediction]
+    full_predictions: Optional[List[List[Dict[str, object]]]] = None  # [token][prediction] - full model predictions (probabilities)
+    full_predictions_normalized: Optional[List[List[Dict[str, object]]]] = None  # [token][prediction] - normalized logits (attention boost)
     model_name: str
     n_layers: int
     n_heads: int
@@ -705,6 +830,18 @@ class BigramTopKResp(BaseModel):
     available: bool  # False if token not in model
 
 
+class BigramBatchReq(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    text: str  # Input text to tokenize and analyze
+    k: int = 10  # Number of top predictions per token
+
+
+class BigramBatchResp(BaseModel):
+    tokens: List[Dict[str, object]]  # [{id, text}, ...] for all tokens
+    predictions: List[List[Dict[str, object]]]  # [position][prediction] - predictions for each position
+
+
 @app.post("/api/attention-patterns", response_model=AttentionPatternsResp)
 def attention_patterns(req: AttentionPatternsReq):
     """
@@ -719,6 +856,7 @@ def attention_patterns(req: AttentionPatternsReq):
             model_name=req.model_name,
             layers=req.layers,
             heads=req.heads,
+            normalize_ov=req.normalize_ov,
         )
         return AttentionPatternsResp(**result)
     except ValueError as exc:
@@ -757,26 +895,14 @@ def bigram_topk(req: BigramTopKReq):
             f"Using first token ID: {token_id}"
         )
 
-    # Get top-k predictions
-    top_k = BIGRAM_MODEL.get_top_k_next(token_id, k=req.k)
-
-    # Format response
-    predictions = []
-    for next_token_id, prob in top_k:
-        token_str = decode([next_token_id])
-        logit = float(np.log(prob)) if prob > 0 else float('-inf')
-        predictions.append({
-            "token": token_str,
-            "id": int(next_token_id),
-            "prob": float(prob),
-            "logit": logit,
-        })
+    # Get top-k predictions using the shared function
+    predictions = _get_bigram_predictions(token_id, k=req.k)
 
     return BigramTopKResp(
-        predictions=predictions,
+        predictions=predictions if predictions else [],
         input_token=req.token,
         input_token_id=token_id,
-        available=len(top_k) > 0
+        available=predictions is not None and len(predictions) > 0
     )
 
 
@@ -797,6 +923,11 @@ def bigram_batch(req: BigramBatchReq):
     # Encode the input text
     token_ids = encode(req.text)
 
+    # Prepend BOS token (consistent with attention-patterns endpoint)
+    bos_token_id = MODELS["t1"].tokenizer.bos_token_id
+    if bos_token_id is not None and (len(token_ids) == 0 or token_ids[0] != bos_token_id):
+        token_ids = [bos_token_id] + token_ids
+
     if len(token_ids) == 0:
         raise HTTPException(
             status_code=400,
@@ -806,42 +937,17 @@ def bigram_batch(req: BigramBatchReq):
     # Get token information
     tokens = [{"id": int(tid), "text": decode([tid])} for tid in token_ids]
 
-    # Get predictions for each token (except the last one, which has no "next" token)
+    # Get predictions for each token using the shared function
     all_predictions = []
     for token_id in token_ids:
-        # Get top-k predictions for this token
-        top_k = BIGRAM_MODEL.get_top_k_next(token_id, k=req.k)
-
-        # Format predictions
-        predictions = []
-        for next_token_id, prob in top_k:
-            token_str = decode([next_token_id])
-            logit = float(np.log(prob)) if prob > 0 else float('-inf')
-            predictions.append({
-                "token": token_str,
-                "id": int(next_token_id),
-                "prob": float(prob),
-                "logit": logit,
-            })
-
-        all_predictions.append(predictions)
+        predictions = _get_bigram_predictions(token_id, k=req.k)
+        # If no predictions available, append empty list
+        all_predictions.append(predictions if predictions else [])
 
     return BigramBatchResp(
         tokens=tokens,
         predictions=all_predictions
     )
-
-
-class BigramBatchReq(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    text: str  # Input text to tokenize and analyze
-    k: int = 10  # Number of top predictions per token
-
-
-class BigramBatchResp(BaseModel):
-    tokens: List[Dict[str, object]]  # [{id, text}, ...] for all tokens
-    predictions: List[List[Dict[str, object]]]  # [position][prediction] - predictions for each position
 
 
 class AttentionTopKReq(BaseModel):
