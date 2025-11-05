@@ -537,6 +537,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/")
+def root():
+    """Health check endpoint."""
+    return {"status": "ok", "message": "Induction Heads API"}
+
 
 
 @torch.no_grad()
