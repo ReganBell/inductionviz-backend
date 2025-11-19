@@ -156,6 +156,22 @@ def logits_zero_attn_path(model: HookedTransformer, tokens: torch.Tensor) -> tor
     return logits
 
 
+def make_zero_pos_embed_hook():
+    """
+    Create a hook to zero out positional embeddings.
+
+    This hook intercepts the positional embedding addition in TransformerLens
+    and returns zeros instead, effectively disabling positional information.
+
+    Returns:
+        Hook function that can be used with model.run_with_cache(fwd_hooks=...)
+    """
+    def hook_fn(value, hook):
+        # Zero out positional embeddings
+        return torch.zeros_like(value)
+    return hook_fn
+
+
 @torch.no_grad()
 def calculate_composition_scores(model: HookedTransformer, subtract_baseline: bool = True) -> Dict[str, List[List[float]]]:
     """
@@ -260,18 +276,27 @@ def _resolve_top_k(top_k: int, vocab_size: int) -> int:
 
 
 @torch.no_grad()
-def _run_with_cache(model: HookedTransformer, toks: torch.Tensor):
+def _run_with_cache(model: HookedTransformer, toks: torch.Tensor, disable_positional_embeddings: bool = False):
     # Capture both attention patterns and value vectors
     pattern_names = [f"blocks.{layer}.attn.hook_pattern" for layer in range(model.cfg.n_layers)]
     value_names = [f"blocks.{layer}.attn.hook_v" for layer in range(model.cfg.n_layers)]
     names = pattern_names + value_names
 
-    logits, cache = model.run_with_cache(
-        toks,
-        names_filter=lambda n: n in names,
-        return_type="logits",
-    )
-    return logits.squeeze(0), cache
+    # Add hook to zero out positional embeddings if requested
+    if disable_positional_embeddings:
+        model.add_hook("hook_pos_embed", make_zero_pos_embed_hook())
+
+    try:
+        logits, cache = model.run_with_cache(
+            toks,
+            names_filter=lambda n: n in names,
+            return_type="logits",
+        )
+        return logits.squeeze(0), cache
+    finally:
+        # Clean up hook if we added one
+        if disable_positional_embeddings:
+            model.reset_hooks()
 
 
 
@@ -379,7 +404,7 @@ def _get_bigram_predictions(token_id: int, k: int = 10) -> Optional[List[Dict[st
     return predictions
 
 
-def analyze_text(text: str, *, top_k: int = 10, compute_ablations: bool = False, models: Optional[Dict[str, HookedTransformer]] = None):
+def analyze_text(text: str, *, top_k: int = 10, compute_ablations: bool = False, disable_positional_embeddings: bool = False, models: Optional[Dict[str, HookedTransformer]] = None):
     if models is None:
         models = MODELS
     # load text from hp.txt
@@ -397,8 +422,8 @@ def analyze_text(text: str, *, top_k: int = 10, compute_ablations: bool = False,
     toks = torch.tensor(ids, device=DEVICE, dtype=torch.long).unsqueeze(0)
     T = toks.size(1)
 
-    logits1_full, cache1 = _run_with_cache(models["t1"], toks)
-    logits2_full, cache2 = _run_with_cache(models["t2"], toks)
+    logits1_full, cache1 = _run_with_cache(models["t1"], toks, disable_positional_embeddings)
+    logits2_full, cache2 = _run_with_cache(models["t2"], toks, disable_positional_embeddings)
 
     skip_positions = set(_skip_trigram_positions(ids))
 
@@ -537,6 +562,7 @@ class AnalyzeReq(BaseModel):
     text: str
     top_k: int = 10
     compute_ablations: bool = False
+    disable_positional_embeddings: bool = False
 
 
 class AnalyzeResp(BaseModel):
@@ -576,6 +602,7 @@ def get_attention_patterns(
     compute_full: bool = True,
     top_k: int = 10,
     normalize_ov: bool = True,
+    disable_positional_embeddings: bool = False,
 ):
     """
     Get attention patterns for a given text.
@@ -623,6 +650,10 @@ def get_attention_patterns(
         # Run model with cache to get attention patterns and logits
         # For OV circuit, we only need attention patterns - we'll use W_E directly
         hook_names = [f"blocks.{layer}.attn.hook_pattern" for layer in range(model.cfg.n_layers)]
+
+        # Add hook to zero out positional embeddings if requested
+        if disable_positional_embeddings:
+            model.add_hook("hook_pos_embed", make_zero_pos_embed_hook())
 
         logits, cache = model.run_with_cache(
             toks,
@@ -790,7 +821,7 @@ def get_attention_patterns(
 def analyze(req: AnalyzeReq):
     log_memory_usage("at start of /api/analyze request")
     try:
-        result = analyze_text(req.text, top_k=req.top_k, compute_ablations=req.compute_ablations)
+        result = analyze_text(req.text, top_k=req.top_k, compute_ablations=req.compute_ablations, disable_positional_embeddings=req.disable_positional_embeddings)
         log_memory_usage("at end of /api/analyze request")
         return result
     except ValueError as exc:
@@ -830,6 +861,7 @@ class AttentionPatternsReq(BaseModel):
     layers: Optional[List[int]] = None  # e.g., [0, 1] or None for all
     heads: Optional[List[int]] = None   # e.g., [0, 2] or None for all
     normalize_ov: bool = True  # Whether to normalize OV logits by subtracting mean
+    disable_positional_embeddings: bool = False
 
 
 class AttentionPatternsResp(BaseModel):
@@ -884,6 +916,7 @@ def attention_patterns(req: AttentionPatternsReq):
             layers=req.layers,
             heads=req.heads,
             normalize_ov=req.normalize_ov,
+            disable_positional_embeddings=req.disable_positional_embeddings,
         )
         return AttentionPatternsResp(**result)
     except ValueError as exc:
@@ -984,6 +1017,7 @@ class AttentionTopKReq(BaseModel):
     model_name: str = "t1"  # "t1" or "t2"
     position: int  # Which token position to get predictions for
     k: int = 10  # Number of top predictions to return
+    disable_positional_embeddings: bool = False
 
 
 class AttentionTopKResp(BaseModel):
@@ -1017,7 +1051,13 @@ def attention_topk(req: AttentionTopKReq):
     toks = torch.tensor(ids, device=DEVICE, dtype=torch.long).unsqueeze(0)
 
     # Run model to get logits
-    logits = model(toks)  # [1, seq_len, vocab_size]
+    if req.disable_positional_embeddings:
+        # Use run_with_hooks to zero out positional embeddings
+        fwd_hooks = [("hook_pos_embed", make_zero_pos_embed_hook())]
+        logits = model.run_with_hooks(toks, fwd_hooks=fwd_hooks)  # [1, seq_len, vocab_size]
+    else:
+        logits = model(toks)  # [1, seq_len, vocab_size]
+
     position_logits = logits[0, req.position, :]  # [vocab_size]
 
     # Normalize by subtracting mean (same as OV circuit normalization)
