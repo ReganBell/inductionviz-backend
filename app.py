@@ -1082,6 +1082,257 @@ def attention_topk(req: AttentionTopKReq):
     )
 
 
+class BatchCompletionsReq(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    text: str  # Input text to tokenize
+    max_new_tokens: int = 20  # Maximum tokens to generate per completion
+    stop_tokens: List[str] = ['.', '!', '?']  # Tokens that stop generation
+    temperature: float = 0.4  # Sampling temperature
+    model_name: Optional[str] = None  # "bigram", "t1", or "t2" (default: bigram)
+    layer: Optional[int] = None  # Layer to use (for t1/t2 models)
+    head: Optional[int] = None  # Head to use (for t1/t2 models)
+
+
+class CompletionInfo(BaseModel):
+    prefix_length: int  # Number of tokens in prefix (including BOS)
+    completion_text: str  # Generated completion as string
+    completion_tokens: List[str]  # Generated tokens as list
+    stopped_reason: str  # "eos" | "stop_token" | "max_length"
+
+
+class BatchCompletionsResp(BaseModel):
+    tokens: List[Dict[str, object]]  # [{id, text}, ...] for input tokens
+    completions: List[CompletionInfo]  # Completion for each prefix length
+
+
+@torch.no_grad()
+def generate_completion_from_bigram(
+    prefix_ids: List[int],
+    max_new_tokens: int,
+    stop_tokens: List[str],
+    temperature: float = 1.0
+):
+    """
+    Generate a multi-token completion using the bigram model.
+
+    Returns:
+        (generated_token_ids, stopped_reason)
+    """
+    if not BIGRAM_MODEL:
+        return [], "no_model"
+
+    current_ids = prefix_ids.copy()
+    generated = []
+
+    for _ in range(max_new_tokens):
+        # Get predictions from last token
+        last_token_id = current_ids[-1]
+        predictions = _get_bigram_predictions(last_token_id, k=50)  # Get top 50 for sampling
+
+        if not predictions or len(predictions) == 0:
+            return generated, "no_predictions"
+
+        # Sample from predictions using temperature
+        if temperature == 0:
+            # Greedy: take top prediction
+            next_token_id = predictions[0]["id"]
+        else:
+            # Temperature sampling
+            probs = np.array([p["prob"] for p in predictions], dtype=np.float64)
+
+            # Apply temperature
+            if temperature != 1.0:
+                logits = np.log(probs + 1e-10)
+                logits = logits / temperature
+                # Subtract max for numerical stability
+                logits = logits - np.max(logits)
+                probs = np.exp(logits)
+                probs = probs / probs.sum()
+            else:
+                # Normalize to ensure sum is exactly 1.0
+                probs = probs / probs.sum()
+
+            # Sample
+            token_ids = [p["id"] for p in predictions]
+            next_token_id = int(np.random.choice(token_ids, p=probs))
+
+        generated.append(next_token_id)
+        current_ids.append(next_token_id)
+
+        # Check stop conditions
+        next_token_str = decode([next_token_id])
+
+        # Check if it's a stop token
+        if next_token_str in stop_tokens:
+            return generated, "stop_token"
+
+        # Check for EOS
+        bos_token_id = MODELS["t1"].tokenizer.bos_token_id
+        eos_token_id = MODELS["t1"].tokenizer.eos_token_id
+        if eos_token_id is not None and next_token_id == eos_token_id:
+            return generated, "eos"
+
+    return generated, "max_length"
+
+
+@torch.no_grad()
+def generate_completion_from_model(
+    prefix_ids: List[int],
+    max_new_tokens: int,
+    stop_tokens: List[str],
+    temperature: float = 1.0,
+    model_name: str = "t1",
+    top_k: int = 50
+):
+    """
+    Generate a multi-token completion using a transformer model (t1 or t2).
+
+    Returns:
+        (generated_token_ids, stopped_reason)
+    """
+    if model_name not in MODELS:
+        return [], "invalid_model"
+
+    model = MODELS[model_name]
+    model_lock = MODEL_LOCKS[model_name]
+
+    current_ids = prefix_ids.copy()
+    generated = []
+
+    for _ in range(max_new_tokens):
+        # Run model to get logits for next token
+        toks = torch.tensor([current_ids], device=DEVICE, dtype=torch.long)
+
+        with model_lock:
+            logits = model(toks)  # [1, seq_len, vocab_size]
+
+        # Get logits for last position
+        next_logits = logits[0, -1, :]  # [vocab_size]
+
+        # Sample from logits
+        if temperature == 0:
+            # Greedy: take top prediction
+            next_token_id = int(torch.argmax(next_logits).item())
+        else:
+            # Apply temperature and top-k filtering
+            next_logits = next_logits / temperature
+
+            # Top-k filtering
+            if top_k > 0:
+                top_k_logits, top_k_indices = torch.topk(next_logits, min(top_k, next_logits.size(-1)))
+                # Create a mask for top-k tokens
+                logits_filtered = torch.full_like(next_logits, float('-inf'))
+                logits_filtered[top_k_indices] = top_k_logits
+                next_logits = logits_filtered
+
+            # Convert to probabilities
+            probs = F.softmax(next_logits, dim=-1)
+
+            # Sample
+            next_token_id = int(torch.multinomial(probs, 1).item())
+
+        generated.append(next_token_id)
+        current_ids.append(next_token_id)
+
+        # Check stop conditions
+        next_token_str = decode([next_token_id])
+
+        # Check if it's a stop token
+        if next_token_str in stop_tokens:
+            return generated, "stop_token"
+
+        # Check for EOS
+        eos_token_id = model.tokenizer.eos_token_id
+        if eos_token_id is not None and next_token_id == eos_token_id:
+            return generated, "eos"
+
+    return generated, "max_length"
+
+
+@app.post("/api/batch-completions", response_model=BatchCompletionsResp)
+def batch_completions(req: BatchCompletionsReq):
+    """
+    Generate multi-token completions for each prefix of the input text.
+
+    For each token position i, generates a completion starting from tokens[0:i+1]
+    and continuing until a stop token, EOS, or max_new_tokens is reached.
+
+    Can use either the bigram model or a transformer model (t1/t2) for generation.
+    """
+    # Determine which model to use
+    model_name = req.model_name or "bigram"
+
+    if model_name == "bigram" and not BIGRAM_MODEL:
+        raise HTTPException(
+            status_code=503,
+            detail="Bigram model not loaded. Check server logs."
+        )
+
+    if model_name in ["t1", "t2"] and model_name not in MODELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model {model_name} not available"
+        )
+
+    # Encode the input text
+    token_ids = encode(req.text)
+
+    # Prepend BOS token (consistent with other endpoints)
+    bos_token_id = MODELS["t1"].tokenizer.bos_token_id
+    if bos_token_id is not None and (len(token_ids) == 0 or token_ids[0] != bos_token_id):
+        token_ids = [bos_token_id] + token_ids
+
+    if len(token_ids) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Empty text string"
+        )
+
+    # Get token information
+    tokens = [{"id": int(tid), "text": decode([tid])} for tid in token_ids]
+
+    # Generate completions for each prefix
+    completions = []
+    for i in range(len(token_ids)):
+        prefix = token_ids[:i+1]
+
+        # Generate completion from this prefix using the selected model
+        if model_name == "bigram":
+            generated_ids, stopped_reason = generate_completion_from_bigram(
+                prefix,
+                req.max_new_tokens,
+                req.stop_tokens,
+                req.temperature
+            )
+        else:
+            # Use transformer model (t1 or t2)
+            generated_ids, stopped_reason = generate_completion_from_model(
+                prefix,
+                req.max_new_tokens,
+                req.stop_tokens,
+                req.temperature,
+                model_name=model_name,
+                top_k=50
+            )
+
+        # Convert to strings
+        completion_tokens = [decode([tid]) for tid in generated_ids]
+        completion_text = "".join(completion_tokens)
+
+        completions.append(CompletionInfo(
+            prefix_length=len(prefix),
+            completion_text=completion_text,
+            completion_tokens=completion_tokens,
+            stopped_reason=stopped_reason
+        ))
+
+    return BatchCompletionsResp(
+        tokens=tokens,
+        completions=completions
+    )
+
+
 if __name__ == "__main__":
     import uvicorn
 
